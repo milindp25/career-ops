@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/santifer/career-ops/dashboard/internal/data"
+	"github.com/santifer/career-ops/dashboard/internal/model"
 	"github.com/santifer/career-ops/dashboard/internal/theme"
 	"github.com/santifer/career-ops/dashboard/internal/ui/screens"
 )
@@ -19,14 +20,17 @@ type viewState int
 const (
 	viewPipeline viewState = iota
 	viewReport
+	viewProgress
 )
 
 type appModel struct {
-	pipeline      screens.PipelineModel
-	viewer        screens.ViewerModel
-	state         viewState
-	careerOpsPath string
-	theme         theme.Theme
+	pipeline        screens.PipelineModel
+	viewer          screens.ViewerModel
+	progress        screens.ProgressModel
+	state           viewState
+	careerOpsPath   string
+	theme           theme.Theme
+	progressMetrics model.ProgressMetrics
 }
 
 func (m appModel) Init() tea.Cmd {
@@ -39,6 +43,9 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pipeline.Resize(msg.Width, msg.Height)
 		if m.state == viewReport {
 			m.viewer.Resize(msg.Width, msg.Height)
+		}
+		if m.state == viewProgress {
+			m.progress.Resize(msg.Width, msg.Height)
 		}
 		pm, cmd := m.pipeline.Update(msg)
 		m.pipeline = pm
@@ -60,6 +67,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		apps := data.ParseApplications(m.careerOpsPath)
 		metrics := data.ComputeMetrics(apps)
+		m.progressMetrics = data.ComputeProgressMetrics(apps)
 		old := m.pipeline
 		m.pipeline = screens.NewPipelineModel(
 			m.theme,
@@ -79,6 +87,19 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case screens.ViewerClosedMsg:
+		m.state = viewPipeline
+		return m, nil
+
+	case screens.PipelineOpenProgressMsg:
+		m.progress = screens.NewProgressModel(
+			theme.NewTheme("catppuccin-mocha"),
+			m.progressMetrics,
+			m.pipeline.Width(), m.pipeline.Height(),
+		)
+		m.state = viewProgress
+		return m, nil
+
+	case screens.ProgressClosedMsg:
 		m.state = viewPipeline
 		return m, nil
 
@@ -106,6 +127,11 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewer = vm
 			return m, cmd
 		}
+		if m.state == viewProgress {
+			pg, cmd := m.progress.Update(msg)
+			m.progress = pg
+			return m, cmd
+		}
 		pm, cmd := m.pipeline.Update(msg)
 		m.pipeline = pm
 		return m, cmd
@@ -113,10 +139,14 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m appModel) View() string {
-	if m.state == viewReport {
+	switch m.state {
+	case viewReport:
 		return m.viewer.View()
+	case viewProgress:
+		return m.progress.View()
+	default:
+		return m.pipeline.View()
 	}
-	return m.pipeline.View()
 }
 
 func main() {
@@ -134,6 +164,7 @@ func main() {
 
 	// Compute metrics
 	metrics := data.ComputeMetrics(apps)
+	progressMetrics := data.ComputeProgressMetrics(apps)
 
 	// Batch-load all report summaries
 	t := theme.NewTheme("auto")
@@ -150,9 +181,10 @@ func main() {
 	}
 
 	m := appModel{
-		pipeline:      pm,
-		careerOpsPath: careerOpsPath,
-		theme:         t,
+		pipeline:        pm,
+		careerOpsPath:   careerOpsPath,
+		theme:           t,
+		progressMetrics: progressMetrics,
 	}
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
