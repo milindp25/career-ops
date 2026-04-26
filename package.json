@@ -15,6 +15,12 @@
     "rollback": "node update-system.mjs rollback",
     "liveness": "node check-liveness.mjs",
     "scan": "node scan.mjs",
+    "scan:1": "node scan.mjs --batch 75 --offset 0",
+    "scan:2": "node scan.mjs --batch 75 --offset 75",
+    "scan:3": "node scan.mjs --batch 75 --offset 150",
+    "scan:all": "npm run scan:1 && npm run scan:2 && npm run scan:3",
+    "discover": "node discover-ats.mjs",
+    "discover:refresh": "node discover-ats.mjs --refresh",
     "gemini:eval": "node gemini-eval.mjs"
   },
   "keywords": [

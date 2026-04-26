@@ -17,14 +17,19 @@
 
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from 'fs';
 import yaml from 'js-yaml';
+import { chromium } from 'playwright';
 const parseYaml = yaml.load;
 
 // ── Config ──────────────────────────────────────────────────────────
 
-const PORTALS_PATH = 'portals.yml';
+const PORTALS_PATH    = 'portals.yml';
+const PROFILES_PATH   = 'data/page-profiles.json';
 const SCAN_HISTORY_PATH = 'data/scan-history.tsv';
-const PIPELINE_PATH = 'data/pipeline.md';
+const PIPELINE_PATH   = 'data/pipeline.md';
 const APPLICATIONS_PATH = 'data/applications.md';
+const PAGE_TIMEOUT_MS = 20_000;
+const WAIT_FOR_JS_MS  = 2_500;
+const PLAYWRIGHT_CONCURRENCY = 3; // browsers open at once
 
 // Ensure required directories exist (fresh setup)
 mkdirSync('data', { recursive: true });
@@ -35,9 +40,13 @@ const FETCH_TIMEOUT_MS = 10_000;
 // ── API detection ───────────────────────────────────────────────────
 
 function detectApi(company) {
-  // Greenhouse: explicit api field
-  if (company.api && company.api.includes('greenhouse')) {
-    return { type: 'greenhouse', url: company.api };
+  // Explicit api: field in portals.yml — detect type from URL
+  if (company.api) {
+    if (company.api.includes('greenhouse'))      return { type: 'greenhouse',      url: company.api };
+    if (company.api.includes('lever'))           return { type: 'lever',           url: company.api };
+    if (company.api.includes('ashbyhq'))         return { type: 'ashby',           url: company.api };
+    if (company.api.includes('smartrecruiters')) return { type: 'smartrecruiters', url: company.api };
+    if (company.api.includes('myworkdayjobs'))   return { type: 'workday',           url: company.api };
   }
 
   const url = company.careers_url || '';
@@ -104,7 +113,28 @@ function parseLever(json, companyName) {
   }));
 }
 
-const PARSERS = { greenhouse: parseGreenhouse, ashby: parseAshby, lever: parseLever };
+function parseWorkday(json, companyName, apiUrl) {
+  const origin = new URL(apiUrl).origin; // https://{tenant}.wd5.myworkdayjobs.com
+  const jobs = json.jobPostings || [];
+  return jobs.map(j => ({
+    title: j.title || '',
+    url: j.externalPath ? `${origin}${j.externalPath}` : '',
+    company: companyName,
+    location: j.locationsText || '',
+  })).filter(j => j.url);
+}
+
+function parseSmartRecruiters(json, companyName) {
+  const jobs = json.content || [];
+  return jobs.map(j => ({
+    title: j.name || '',
+    url: j.ref || '',
+    company: companyName,
+    location: [j.location?.city, j.location?.country].filter(Boolean).join(', '),
+  }));
+}
+
+const PARSERS = { greenhouse: parseGreenhouse, ashby: parseAshby, lever: parseLever, smartrecruiters: parseSmartRecruiters, workday: parseWorkday };
 
 // ── Fetch with timeout ──────────────────────────────────────────────
 
@@ -113,6 +143,24 @@ async function fetchJson(url) {
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
     const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Workday uses POST with pagination body (unlike every other ATS which is GET)
+async function fetchWorkday(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ appliedFacets: {}, limit: 100, offset: 0, searchText: '' }),
+      signal: controller.signal,
+    });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   } finally {
@@ -131,6 +179,31 @@ function buildTitleFilter(titleFilter) {
     const hasPositive = positive.length === 0 || positive.some(k => lower.includes(k));
     const hasNegative = negative.some(k => lower.includes(k));
     return hasPositive && !hasNegative;
+  };
+}
+
+// ── Location filter ──────────────────────────────────────────────────
+
+function buildLocationFilter(locationFilter) {
+  if (!locationFilter) return () => true;
+
+  // Word-boundary regex instead of substring match: "US" must not match
+  // "Austria", "Russia", "Brussels", etc. Slashes, commas, hyphens, and
+  // spaces all act as boundaries, so "Remote, US" and "/us/en/job/" still match.
+  const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const toRegex  = k => new RegExp(`\\b${escapeRe(k.trim())}\\b`, 'i');
+
+  const required = (locationFilter.require_any || []).map(toRegex);
+  const excluded = (locationFilter.exclude_any || []).map(toRegex);
+
+  return (location, fallback = '') => {
+    // Career-page scraper can't extract location — fall back to title+url,
+    // which usually contains the city (e.g. /job/london/ or "...Budapest, Hungary").
+    const text = (location && location.trim()) ? location : fallback;
+    if (!text || !text.trim()) return true; // nothing to go on — allow (API jobs with blank location)
+
+    if (excluded.some(re => re.test(text))) return false;
+    return required.length === 0 || required.some(re => re.test(text));
   };
 }
 
@@ -229,6 +302,52 @@ function appendToScanHistory(offers, date) {
   appendFileSync(SCAN_HISTORY_PATH, lines, 'utf-8');
 }
 
+// ── Career page scraper (Playwright) ───────────────────────────────
+// Uses stored selector from page-profiles.json — much cheaper than full snapshot.
+
+async function scrapeCareerPage(browser, profile, companyName) {
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (compatible; career-ops-scanner/1.0)',
+  });
+  const page = await context.newPage();
+
+  try {
+    await page.goto(profile.careers_url, {
+      waitUntil: 'domcontentloaded',
+      timeout: PAGE_TIMEOUT_MS,
+    });
+    await page.waitForTimeout(WAIT_FOR_JS_MS);
+
+    const selector = profile.job_selector;
+    if (!selector) throw new Error('no selector in profile');
+
+    // Extract (title, href) pairs from matching elements
+    const rawJobs = await page.evaluate((sel) => {
+      const elements = Array.from(document.querySelectorAll(sel));
+      return elements.map(el => {
+        // Walk up to find closest anchor if el isn't one
+        const anchor = el.tagName === 'A' ? el : el.closest('a') || el.querySelector('a');
+        const title  = (el.textContent || '').trim().replace(/\s+/g, ' ');
+        const href   = anchor?.href || '';
+        return { title, url: href };
+      }).filter(j => j.title && j.url && j.url.startsWith('http'));
+    }, selector);
+
+    // Attach company name and filter out nav/footer links (must look like a job URL)
+    const JOB_URL_RE = /\/(job|jobs|careers?|opening|position|posting|apply|requisition)s?[/-]/i;
+    const jobs = rawJobs
+      .map(j => ({ ...j, company: companyName }))
+      .filter(j => JOB_URL_RE.test(j.url) || j.url.includes('greenhouse.io') || j.url.includes('lever.co') || j.url.includes('ashbyhq.com'));
+
+    return { jobs, source: `career-page:${profile.ats || 'custom'}` };
+
+  } catch (err) {
+    return { jobs: null, error: err.message.slice(0, 100) };
+  } finally {
+    await context.close();
+  }
+}
+
 // ── Parallel fetch with concurrency limit ───────────────────────────
 
 async function parallelFetch(tasks, limit) {
@@ -254,6 +373,10 @@ async function main() {
   const dryRun = args.includes('--dry-run');
   const companyFlag = args.indexOf('--company');
   const filterCompany = companyFlag !== -1 ? args[companyFlag + 1]?.toLowerCase() : null;
+  const batchFlag = args.indexOf('--batch');
+  const batchSize = batchFlag !== -1 ? parseInt(args[batchFlag + 1], 10) : null;
+  const offsetFlag = args.indexOf('--offset');
+  const batchOffset = offsetFlag !== -1 ? parseInt(args[offsetFlag + 1], 10) : 0;
 
   // 1. Read portals.yml
   if (!existsSync(PORTALS_PATH)) {
@@ -261,20 +384,62 @@ async function main() {
     process.exit(1);
   }
 
-  const config = parseYaml(readFileSync(PORTALS_PATH, 'utf-8'));
-  const companies = config.tracked_companies || [];
-  const titleFilter = buildTitleFilter(config.title_filter);
+  const config          = parseYaml(readFileSync(PORTALS_PATH, 'utf-8'));
+  const companies       = config.tracked_companies || [];
+  const titleFilter     = buildTitleFilter(config.title_filter);
+  const locationFilter  = buildLocationFilter(config.location_filter);
 
-  // 2. Filter to enabled companies with detectable APIs
-  const targets = companies
+  // 2. Load page profiles (from discover-ats.mjs)
+  const profiles = existsSync(PROFILES_PATH)
+    ? JSON.parse(readFileSync(PROFILES_PATH, 'utf-8'))
+    : {};
+
+  // 3. Bucket companies into: career-page (profiled), api-only, skipped
+  const enabled = companies
     .filter(c => c.enabled !== false)
-    .filter(c => !filterCompany || c.name.toLowerCase().includes(filterCompany))
-    .map(c => ({ ...c, _api: detectApi(c) }))
+    .filter(c => !filterCompany || c.name.toLowerCase().includes(filterCompany));
+
+  // Career page path: has a profile with a working selector
+  const careerPageTargets = enabled
+    .filter(c => profiles[c.name]?.job_selector && profiles[c.name]?.status === 'ok');
+
+  // API-only path: no usable selector — use portals.yml api: field, auto-detected URL pattern,
+  // or api_endpoint stored in page-profiles.json (whichever is available first)
+  const apiOnlyTargets = enabled
+    .filter(c => !profiles[c.name]?.job_selector)
+    .map(c => {
+      const profileApi = profiles[c.name]?.api_endpoint
+        ? { type: profiles[c.name].ats || 'greenhouse', url: profiles[c.name].api_endpoint }
+        : null;
+      return { ...c, _api: detectApi(c) || profileApi };
+    })
     .filter(c => c._api !== null);
 
-  const skippedCount = companies.filter(c => c.enabled !== false).length - targets.length;
+  const skippedCount = enabled.length - careerPageTargets.length - apiOnlyTargets.length;
 
-  console.log(`Scanning ${targets.length} companies via API (${skippedCount} skipped — no API detected)`);
+  // Apply batch slicing (applies to the combined total)
+  const allTargets   = [...careerPageTargets.map(c => ({ ...c, _mode: 'career' })),
+                        ...apiOnlyTargets.map(c => ({ ...c, _mode: 'api' }))];
+  const totalTargets = allTargets.length;
+  const sliced       = batchSize ? allTargets.slice(batchOffset, batchOffset + batchSize) : allTargets;
+  const batchLabel   = batchSize
+    ? ` [batch ${batchOffset + 1}–${Math.min(batchOffset + batchSize, totalTargets)} of ${totalTargets}]`
+    : '';
+
+  const slicedCareer = sliced.filter(c => c._mode === 'career');
+  const slicedApi    = sliced.filter(c => c._mode === 'api');
+
+  console.log(`Scanning ${sliced.length} companies${batchLabel}`);
+  console.log(`  Career pages (Playwright): ${slicedCareer.length}`);
+  console.log(`  API-only (zero-token):     ${slicedApi.length}`);
+  console.log(`  Skipped (no profile/API):  ${skippedCount}`);
+  if (skippedCount > 0) {
+    const label = Object.keys(profiles).length === 0
+      ? '\n  Tip: run `node discover-ats.mjs` to profile all career pages'
+      : `\n  Tip: ${skippedCount} company/ies have no profile yet — run \`node discover-ats.mjs\` to pick them up`;
+    console.log(label);
+    console.log('  (new companies are auto-detected; existing profiles are untouched)\n');
+  }
   if (dryRun) console.log('(dry run — no files will be written)\n');
 
   // 3. Load dedup sets
@@ -289,38 +454,75 @@ async function main() {
   const newOffers = [];
   const errors = [];
 
-  const tasks = targets.map(company => async () => {
+  // ── Job processor (shared by career-page and API paths) ─────────────
+  // Increments counters, deduplicates, and pushes passing jobs to newOffers.
+  const processJobs = (jobs, source) => {
+    totalFound += jobs.length;
+    for (const job of jobs) {
+      if (!job.url) continue;
+      if (!titleFilter(job.title)) { totalFiltered++; continue; }
+      if (!locationFilter(job.location, `${job.title} ${job.url}`)) { totalFiltered++; continue; }
+      const companyRoleKey = `${(job.company || '').toLowerCase()}::${job.title.toLowerCase()}`;
+      if (seenUrls.has(job.url) || seenCompanyRoles.has(companyRoleKey)) { totalDupes++; continue; }
+      seenUrls.add(job.url);
+      seenCompanyRoles.add(companyRoleKey);
+      newOffers.push({ ...job, source });
+    }
+  };
+
+  // ── Run career page tasks (Playwright, career page first) ──────────
+  let browser = null;
+  if (slicedCareer.length > 0) {
+    browser = await chromium.launch({ headless: true });
+
+    const careerTasks = slicedCareer.map(company => async () => {
+      const profile = profiles[company.name];
+      const { jobs, source, error } = await scrapeCareerPage(browser, profile, company.name);
+
+      // If career page failed, fall back to API
+      if (!jobs) {
+        const fallbackApi = detectApi(company) ||
+          (profile.api_endpoint ? { type: profile.ats || 'api', url: profile.api_endpoint } : null);
+
+        if (fallbackApi) {
+          try {
+            const json = await fetchJson(fallbackApi.url);
+            const parsed = PARSERS[fallbackApi.type]
+              ? PARSERS[fallbackApi.type](json, company.name, fallbackApi.url)
+              : [];
+            processJobs(parsed, `${fallbackApi.type}-api (fallback)`);
+          } catch (err) {
+            errors.push({ company: company.name, error: `career page: ${error} | api fallback: ${err.message}` });
+          }
+        } else {
+          errors.push({ company: company.name, error });
+        }
+        return;
+      }
+
+      processJobs(jobs, source);
+    });
+
+    await parallelFetch(careerTasks, PLAYWRIGHT_CONCURRENCY);
+    await browser.close();
+    browser = null;
+  }
+
+  // ── Run API-only tasks ───────────────────────────────────────────────
+  const apiTasks = slicedApi.map(company => async () => {
     const { type, url } = company._api;
     try {
-      const json = await fetchJson(url);
-      const jobs = PARSERS[type](json, company.name);
-      totalFound += jobs.length;
-
-      for (const job of jobs) {
-        if (!titleFilter(job.title)) {
-          totalFiltered++;
-          continue;
-        }
-        if (seenUrls.has(job.url)) {
-          totalDupes++;
-          continue;
-        }
-        const key = `${job.company.toLowerCase()}::${job.title.toLowerCase()}`;
-        if (seenCompanyRoles.has(key)) {
-          totalDupes++;
-          continue;
-        }
-        // Mark as seen to avoid intra-scan dupes
-        seenUrls.add(job.url);
-        seenCompanyRoles.add(key);
-        newOffers.push({ ...job, source: `${type}-api` });
-      }
+      const json = type === 'workday' ? await fetchWorkday(url) : await fetchJson(url);
+      const parser = PARSERS[type];
+      if (!parser) throw new Error(`No parser for ATS type: ${type}`);
+      const jobs = parser(json, company.name, url);
+      processJobs(jobs, `${type}-api`);
     } catch (err) {
       errors.push({ company: company.name, error: err.message });
     }
   });
 
-  await parallelFetch(tasks, CONCURRENCY);
+  await parallelFetch(apiTasks, CONCURRENCY);
 
   // 5. Write results
   if (!dryRun && newOffers.length > 0) {
@@ -332,7 +534,7 @@ async function main() {
   console.log(`\n${'━'.repeat(45)}`);
   console.log(`Portal Scan — ${date}`);
   console.log(`${'━'.repeat(45)}`);
-  console.log(`Companies scanned:     ${targets.length}`);
+  console.log(`Companies scanned:     ${sliced.length}`);
   console.log(`Total jobs found:      ${totalFound}`);
   console.log(`Filtered by title:     ${totalFiltered} removed`);
   console.log(`Duplicates:            ${totalDupes} skipped`);
