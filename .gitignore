@@ -3,6 +3,7 @@ cv.md
 data/applications.md
 data/pipeline.md
 data/scan-history.tsv
+data/page-profiles.json
 reports/*.md
 !reports/.gitkeep
 output/*
@@ -13,6 +14,11 @@ batch/batch-state.tsv
 batch/batch-input.tsv
 batch/tracker-additions/**/*.tsv
 !batch/tracker-additions/.gitkeep
+batch/*.pid
+batch/*.tmp
+batch/.batch-state.lock/
+article-digest.md
+tmp/
 jds/*
 !jds/.gitkeep
 
